@@ -1,0 +1,281 @@
+*******************************************************************************
+* Analyzing industry-by-state level data to explore a policy's effect on bonus depreciation implementation on employment
+*******************************************************************************
+clear
+clear all
+set mem 3g
+set matsize 11000
+set more off
+capture log close
+set type double
+pause on
+
+* Set Working Directory (insert directory below)
+cd ""
+import delimited "qwi.csv", clear
+
+
+* Label variables
+label variable fipstate "State FIPS code"
+label variable naics "4-digit NAICS code"
+label variable gender "Demographic category: 0 for total, 1 if male, 2 if female"
+label variable year "Year"
+label variable quarter "Quarter"
+label variable emps "Total Employment"
+label variable earns "Average Labor Earnings"
+label variable mftg "Manufacturing"
+
+describe
+summarize
+
+*******************************************************************************
+* Descriptive Analysis
+*******************************************************************************
+
+preserve
+
+* Filter data for 2001 Q3
+keep if year == 2001 & quarter == 3
+
+* Calculate means and standard deviations
+collapse (mean) emps_mean=emps earns_mean=earns (sd) emps_sd=emps, by(gender)
+
+* Add variable labels
+label variable emps_mean "Mean Employment"
+label variable emps_sd "Std. Dev. Employment"
+label variable earns_mean "Mean Earnings"
+label define gender_lbl 0 "All Workers" 1 "Male" 2 "Female"
+label values gender gender_lbl
+
+* Create table of summary statistics
+tabstat emps_mean emps_sd earns_mean, by(gender)
+
+restore
+
+
+*******************************************************************************
+* Time-series plot of aggregated employment
+*******************************************************************************
+
+preserve
+
+* Generate a consistent, quarterly date variable
+gen time = yq(year, quarter)
+format time %tq
+
+* Aggregate employment by time and gender
+collapse (sum) emps, by(time gender)
+
+
+* Plot time-series data for each gender
+twoway connected emps time if gender == 0 || connected emps time if gender == 1 || connected emps time if gender == 2, ///
+    legend(order(1 "Total" 2 "Male" 3 "Female")) ///
+    ytitle("Employment") ///
+	xtitle("Time")
+
+* graph export "employment_plot.png", as(png) replace
+
+restore
+
+*******************************************************************************
+* Regression Setup
+*******************************************************************************
+
+* Outcome variable of interest
+gen ln_emps = ln(emps)
+
+* Merge datasets
+save "qwi.dta", replace
+import delimited "bonus_z_4.csv", clear
+save "bonus_z_4.dta", replace
+
+use "qwi.dta", clear
+merge m:1 naics using "bonus_z_4.dta"
+drop _merge
+
+hist z0
+graph export "Bonus Depreciation Distribution.png", as(png) replace
+
+* Treatment variable
+gen treated = (z0 < 0.875)
+
+*******************************************************************************
+* Event Study Regression Analysis
+*******************************************************************************
+
+* Create a consistent time variable
+gen time = yq(year, quarter)
+format time %tq
+
+* Define the event baseline for bonus depreciation policy
+gen policy_time = yq(2001, 3)
+gen quarters_since_event = .
+
+* Replace values for quarters before the event
+forvalues x = 1/18 {
+    replace quarters_since_event = -`x' if time == policy_time - `x'
+}
+
+* Replace values for quarters after the event, including the event quarter itself (0)
+forvalues x = 0/41 {
+    replace quarters_since_event = `x' if time == policy_time + `x'
+}
+
+
+*******************************************************************************
+* Generate indicator variables for each quarter
+*******************************************************************************
+
+* Pre-policy quarters (18 quarters before policy)
+forvalues x = 1/18 {
+    gen PolicyQ_minus`x' = 0
+    replace PolicyQ_minus`x' = 1 if quarters_since_event == -`x' & !missing(quarters_since_event)
+}
+
+* Post-policy quarters (41 quarters after policy)
+forvalues x = 0/41 {
+    gen PolicyQ_plus`x' = 0
+    replace PolicyQ_plus`x' = 1 if quarters_since_event == `x' & !missing(quarters_since_event)
+}
+
+
+
+*******************************************************************************
+* Interact each quarter with 'treated' to isolate the period-specific impact
+*******************************************************************************
+ 
+* Create dummy variables for interaction term between treatment and quarters before policy
+forvalues x = 1/18 {
+    gen T_Qminus`x' = treated * PolicyQ_minus`x'
+}
+
+* Create dummy variables for interaction term between treatment and quarters after policy
+forvalues x = 0/41 {
+    gen T_Qplus`x' = treated * PolicyQ_plus`x'
+}
+
+* Generate state-by-industry and state-by-time fixed effects
+egen state_industry = group(fipstate naics)
+egen state_time = group(fipstate time)
+
+* Weight observations using 2001 Q3 employment
+hist ln_emps if year == 2001 & quarter  == 3
+* graph export "Distribution of Employment for Policy Implementation Time Period.png", as(png) replace
+
+* Weight on 'Total Employment' for each state & time period
+gen weight = emps if year == 2001 & quarter == 3
+bysort fipstate naics: egen weightmax = max(weight)
+
+
+*******************************************************************************
+* Estimate the total employment model
+*******************************************************************************
+* Regress on each quarter*treatment interaction term weighted by 2001q3 with state industry and state time fixed effects, clustered by state industry. Omit 2001q3 (T_Qplus0) to normalize values to the policy implementation quarter
+
+reghdfe ln_emps T_Qminus* T_Qplus1 T_Qplus2 T_Qplus3 T_Qplus4 T_Qplus5 T_Qplus6 T_Qplus7 T_Qplus8 T_Qplus9 T_Qplus10 T_Qplus11 T_Qplus12 T_Qplus13 T_Qplus14 T_Qplus15 T_Qplus16 T_Qplus17 T_Qplus18 T_Qplus19 T_Qplus20 T_Qplus21 T_Qplus22 T_Qplus23 T_Qplus24 T_Qplus25 T_Qplus26 T_Qplus27 T_Qplus28 T_Qplus29 T_Qplus30 T_Qplus31 T_Qplus32 T_Qplus33 T_Qplus34 T_Qplus35 T_Qplus36 T_Qplus37 T_Qplus38 T_Qplus39 T_Qplus40 T_Qplus41 [aweight = weightmax], absorb(state_time state_industry) cluster(state_industry)
+
+* Save coefficients and standard errors for graph creation
+estimates store total_model
+
+*******************************************************************************
+* Graph total employment B_y coefficients and confidence intervals 
+*******************************************************************************
+
+preserve
+eststo total_model
+
+coefplot total_model, drop(_cons) vertical xline(18.5, lpattern(solid)) /// 
+    keep(T_Qminus* T_Qplus*) /// 
+    xlabel(, angle(65) labsize(small)) /// 
+    xtitle("Quarters Relative to 2001 Q3") /// 
+    ytitle("Coefficient Estimates") /// 
+    title("Quarterly Coefficient Plot") /// 
+    legend(off) /// 
+    plotregion(margin(l=3 r=3)) /// 
+    coeflabels(T_Qminus18="-18" T_Qminus1="-1" T_Qminus2="-2" T_Qminus3="-3" /// 
+               T_Qminus4="-4" T_Qminus5="-5" T_Qminus6="-6" /// 
+               T_Qminus7="-7" T_Qminus8="-8" T_Qminus9="-9" /// 
+               T_Qminus10="-10" T_Qminus11="-11" T_Qminus12="-12" /// 
+               T_Qminus13="-13" T_Qminus14="-14" T_Qminus15="-15" /// 
+               T_Qminus16="-16" T_Qminus17="-17" /// 
+               T_Qplus1="1" T_Qplus2="2" T_Qplus3="3" /// 
+               T_Qplus4="4" T_Qplus5="5" T_Qplus6="6" /// 
+               T_Qplus7="7" T_Qplus8="8" T_Qplus9="9" /// 
+               T_Qplus10="10" T_Qplus11="11" T_Qplus12="12" /// 
+               T_Qplus13="13" T_Qplus14="14" T_Qplus15="15" /// 
+               T_Qplus16="16" T_Qplus17="17" T_Qplus18="18" /// 
+               T_Qplus19="19" T_Qplus20="20" T_Qplus21="21" /// 
+               T_Qplus22="22" T_Qplus23="23" T_Qplus24="24" /// 
+               T_Qplus25="25" T_Qplus26="26" T_Qplus27="27" /// 
+               T_Qplus28="28" T_Qplus29="29" T_Qplus30="30" /// 
+               T_Qplus31="31" T_Qplus32="32" T_Qplus33="33" /// 
+               T_Qplus34="34" T_Qplus35="35" T_Qplus36="36" /// 
+               T_Qplus37="37" T_Qplus38="38" T_Qplus39="39" /// 
+               T_Qplus40="40" T_Qplus41="41")
+
+* graph export "Event Study Total Employment Graph.png", as(png) replace
+
+restore
+
+*******************************************************************************
+* Estimate the model separately for males
+*******************************************************************************
+
+* Adjusting the weight to account for just male employment
+bysort fipstate naics: egen weightmale = max(weight) if gender == 1
+
+reghdfe ln_emps T_Qminus* T_Qplus1 T_Qplus2 T_Qplus3 T_Qplus4 T_Qplus5 T_Qplus6 T_Qplus7 T_Qplus8 T_Qplus9 T_Qplus10 T_Qplus11 T_Qplus12 T_Qplus13 T_Qplus14 T_Qplus15 T_Qplus16 T_Qplus17 T_Qplus18 T_Qplus19 T_Qplus20 T_Qplus21 T_Qplus22 T_Qplus23 T_Qplus24 T_Qplus25 T_Qplus26 T_Qplus27 T_Qplus28 T_Qplus29 T_Qplus30 T_Qplus31 T_Qplus32 T_Qplus33 T_Qplus34 T_Qplus35 T_Qplus36 T_Qplus37 T_Qplus38 T_Qplus39 T_Qplus40 T_Qplus41 [aweight = weightmale] if gender == 1, absorb(state_time state_industry) cluster(state_industry)
+
+* Save coefficients and standard errors
+estimates store male_model
+
+*******************************************************************************
+* Estimate the model separately for females
+*******************************************************************************
+
+* Adjusting the weight to account for just female employment
+bysort fipstate naics: egen weightfemale = max(weight) if gender == 2
+
+reghdfe ln_emps T_Qminus* T_Qplus1 T_Qplus2 T_Qplus3 T_Qplus4 T_Qplus5 T_Qplus6 T_Qplus7 T_Qplus8 T_Qplus9 T_Qplus10 T_Qplus11 T_Qplus12 T_Qplus13 T_Qplus14 T_Qplus15 T_Qplus16 T_Qplus17 T_Qplus18 T_Qplus19 T_Qplus20 T_Qplus21 T_Qplus22 T_Qplus23 T_Qplus24 T_Qplus25 T_Qplus26 T_Qplus27 T_Qplus28 T_Qplus29 T_Qplus30 T_Qplus31 T_Qplus32 T_Qplus33 T_Qplus34 T_Qplus35 T_Qplus36 T_Qplus37 T_Qplus38 T_Qplus39 T_Qplus40 T_Qplus41 [aweight = weightfemale] if gender == 2, absorb(state_time state_industry) cluster(state_industry)
+
+* Save coefficients and standard errors
+estimates store female_model
+
+*******************************************************************************
+* Graph Combined Male and Female B_y coefficients and confidence intervals
+*******************************************************************************
+
+* Combine the male and female models in a single coefplot
+coefplot female_model male_model, drop(_cons) vertical xline(18.5, lpattern(solid)) ///
+    keep(T_Qminus* T_Qplus*) ///
+    xlabel(, angle(65) labsize(small)) ///
+	xtitle("Quarters Relative to 2001 Q3") /// 
+    ytitle("Coefficient Estimates") /// 
+    title("Employment Trends by Gender") ///
+    legend(order(1 "Female" 2 "Male")) ///
+    plotregion(margin(l=3 r=3)) ///
+    coeflabels(T_Qminus18="-18" T_Qminus1="-1" T_Qminus2="-2" T_Qminus3="-3" ///
+               T_Qminus4="-4" T_Qminus5="-5" T_Qminus6="-6" ///
+               T_Qminus7="-7" T_Qminus8="-8" T_Qminus9="-9" ///
+               T_Qminus10="-10" T_Qminus11="-11" T_Qminus12="-12" ///
+               T_Qminus13="-13" T_Qminus14="-14" T_Qminus15="-15" ///
+               T_Qminus16="-16" T_Qminus17="-17" ///
+               T_Qplus1="1" T_Qplus2="2" T_Qplus3="3" ///
+               T_Qplus4="4" T_Qplus5="5" T_Qplus6="6" ///
+               T_Qplus7="7" T_Qplus8="8" T_Qplus9="9" ///
+               T_Qplus10="10" T_Qplus11="11" T_Qplus12="12" ///
+               T_Qplus13="13" T_Qplus14="14" T_Qplus15="15" ///
+               T_Qplus16="16" T_Qplus17="17" T_Qplus18="18" ///
+               T_Qplus19="19" T_Qplus20="20" T_Qplus21="21" ///
+               T_Qplus22="22" T_Qplus23="23" T_Qplus24="24" ///
+               T_Qplus25="25" T_Qplus26="26" T_Qplus27="27" ///
+               T_Qplus28="28" T_Qplus29="29" T_Qplus30="30" ///
+               T_Qplus31="31" T_Qplus32="32" T_Qplus33="33" ///
+               T_Qplus34="34" T_Qplus35="35" T_Qplus36="36" ///
+               T_Qplus37="37" T_Qplus38="38" T_Qplus39="39" ///
+               T_Qplus40="40" T_Qplus41="41")
+
+* graph export "Event Study Gender Comparison.png", as(png) replace
+
+
+save "qwi.dta", replace
